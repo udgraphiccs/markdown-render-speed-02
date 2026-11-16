@@ -87,10 +87,17 @@ export function escapeCode(s) {
 export function escapeAttr(s) { return escapeText(s); }
 
 export function normalizeLabel(label) {
-  // Full Unicode case folding is approximated by toLowerCase() (it folds
-  // the overwhelming majority of cases, incl. ligatures via locale-free
-  // mapping); collapse all whitespace runs to a single space and trim.
-  return label.toLowerCase().replace(/\s+/g, " ").trim();
+  // Full Unicode case folding is approximated by toLowerCase() plus the
+  // folds toLowerCase() misses: ß (and ẞ, which lowercases to ß) folds to
+  // "ss" (cm-540), the Latin ligatures expand, and final sigma ς folds
+  // to σ. Collapse all whitespace runs to a single space and trim.
+  return label.toLowerCase()
+    .replace(/ß/g, "ss")
+    .replace(/ﬀ/g, "ff").replace(/ﬁ/g, "fi").replace(/ﬂ/g, "fl")
+    .replace(/ﬃ/g, "ffi").replace(/ﬄ/g, "ffl")
+    .replace(/ﬅ/g, "st").replace(/ﬆ/g, "st")
+    .replace(/ς/g, "σ")
+    .replace(/\s+/g, " ").trim();
 }
 
 const BAD_PROTO = /^(?:javascript|vbscript|data):/i;
@@ -334,7 +341,7 @@ function parseNodes(src, ctx, inLink) {
       i = k; continue;
     }
     if (c === "h" || c === "f" || c === "w" || isAlnum(c)) {
-      const r = tryBareLink(s, i, ctx);
+      const r = tryBareLink(s, i, ctx, inLink);
       if (r) { flush(); nodes.push(r.node); i = r.end; continue; }
     }
     text += c; i++;
@@ -439,25 +446,39 @@ function scanEmailRun(s, i) {
 // Validate a candidate email: trim trailing punctuation, then require a
 // full match. The maximal-run scan is what rejects `hello@mail+xyz` and
 // `a.b-c_d@a.b-` outright instead of linking a prefix (gfm-631/632).
+// A trailing `_` is NOT trimmed when it ends the text: it invalidates
+// the whole match (gfm-632). But when more text follows it, the `_` is
+// an emphasis closer, not part of the email, so it is trimmed and the
+// email links (doc-31/37/38/04: `_warning when@atlas.example.com_`).
 function matchEmail(s, i) {
   const run = scanEmailRun(s, i);
   if (!run.includes("@")) return null;
-  const email = run.replace(TRAIL_PUNCT, "");
+  const email = run.replace(/[?!.,:;*~'"]+$/, "");
   if (email && EMAIL_FULL_RE.test(email)) return email;
+  if (run.endsWith("_") && i + run.length < s.length) {
+    const trimmed = run.replace(/_+$/, "").replace(/[?!.,:;*~'"]+$/, "");
+    if (trimmed && EMAIL_FULL_RE.test(trimmed)) return trimmed;
+  }
   return null;
 }
 
-function tryBareLink(s, i, ctx) {
+function tryBareLink(s, i, ctx, inLink) {
+  // No autolinks of any kind inside link text (doc-12/16/20/39: a bare
+  // URL or email inside a link's text stays plain text).
+  if (inLink) return null;
   if (i > 0) {
     const prev = s[i - 1];
     if (isAlnum(prev) || prev === "_" || prev === "-" || prev === "." || prev === "/") return null;
   }
   const rest = s.slice(i);
-  let m = /^(?:https?:\/\/|ftp:\/\/|www\.)[^\s<]+/.exec(rest);
+  // The scheme is case-insensitive (doc-06/09/10/26/39: `Https://` and
+  // `Http://` autolink) but `www.` is lowercase-only (doc-09: `Www.`
+  // does not link); the href keeps the original case.
+  let m = /^(?:https?:\/\/|ftp:\/\/)[^\s<]+/i.exec(rest) || /^www\.[^\s<]+/.exec(rest);
   if (m) {
     const url = trimBareUrl(m[0]);
     if (url.length > 0) {
-      const href = cleanUrl(url.startsWith("www.") ? "http://" + url : url);
+      const href = cleanUrl(/^www\./i.test(url) ? "http://" + url : url);
       if (href !== null) {
         return { node: { t: "link", href, title: null, children: [{ t: "text", s: url }] }, end: i + url.length };
       }
@@ -476,8 +497,9 @@ function tryBareLink(s, i, ctx) {
       if (s[end] === "/") {
         let k = end + 1;
         while (k < s.length && !/[\s<>/]/.test(s[k])) k++;
-        url += s.slice(end, k);
-        end = k;
+        // A trailing slash with no segment after it is not part of the
+        // link (gfm-633: `mailto:a.b-c_d@a.b/` ends before the slash).
+        if (k > end + 1) { url += s.slice(end, k); end = k; }
       }
       url = trimBareUrl(url);
       const href = cleanUrl(url);
@@ -496,16 +518,26 @@ function tryBareLink(s, i, ctx) {
 
 function trimBareUrl(url) {
   // Strip trailing punctuation: ? ! . , : ; * _ ~ ' " and unbalanced ).
+  // The punctuation and paren steps repeat until stable: stripping a
+  // `)` can expose a `.` that must also go (doc-10: `...nova).`).
   let end = url.length;
-  // Trailing ; that looks like an entity end is kept only if part of one;
-  // GFM strips a trailing punctuation run, so strip ; too when it is last.
-  while (end > 0 && "?!.,:;*_~'\"".includes(url[end - 1])) end--;
-  // Balance parens: drop trailing ) while there are more ) than (.
-  while (end > 0 && url[end - 1] === ")") {
-    const sub = url.slice(0, end);
-    const open = (sub.match(/\(/g) || []).length;
-    const close = (sub.match(/\)/g) || []).length;
-    if (close > open) end--; else break;
+  for (;;) {
+    const before = end;
+    while (end > 0 && "?!.,:;*_~'\"".includes(url[end - 1])) end--;
+    // Balance parens: drop trailing ) while there are more ) than (.
+    while (end > 0 && url[end - 1] === ")") {
+      const sub = url.slice(0, end);
+      const open = (sub.match(/\(/g) || []).length;
+      const close = (sub.match(/\)/g) || []).length;
+      if (close > open) end--; else break;
+    }
+    if (end === before) break;
+  }
+  // A trailing `;` that closes an entity-like `&name` sequence means the
+  // whole `&name;` is not part of the link (gfm-627: `&hl;` is excluded).
+  if (url[end] === ";") {
+    const m = /&[A-Za-z0-9]+$/.exec(url.slice(0, end));
+    if (m) end -= m[0].length;
   }
   return url.slice(0, end);
 }
@@ -706,7 +738,9 @@ function tryLink(s, i, ctx, inLink) {
     if (inLink) return null;
     return { node: { t: "link", href: clean, title, children: parseNodes(label.text, ctx, true) }, end: j };
   };
-  // Inline link: [text](dest "title")
+  // Inline link: [text](dest "title"). When the (...) is not a valid
+  // inline link, fall through and try the reference forms for [text]
+  // instead (cm-568): a failed inline link does not void the shortcut.
   if (s[j] === "(") {
     let k = skipSpaces(s, j + 1);
     if (s[k] === ")") { j = k + 1; return makeNode("", null); }
@@ -714,15 +748,14 @@ function tryLink(s, i, ctx, inLink) {
     if (dest) {
       k = skipSpaces(s, dest.end);
       let title = null;
+      let bad = false;
       if (s[k] === '"' || s[k] === "'" || s[k] === "(") {
         const t = parseTitle(s, k);
-        if (!t) return null;
-        title = t.title;
-        k = skipSpaces(s, t.end);
+        if (!t) bad = true;
+        else { title = t.title; k = skipSpaces(s, t.end); }
       }
-      if (s[k] === ")") { j = k + 1; return makeNode(dest.dest, title); }
+      if (!bad && s[k] === ")") { j = k + 1; return makeNode(dest.dest, title); }
     }
-    return null;
   }
   // Reference link: [text][label] / [text][] / [text]
   if (s[j] === "[") {

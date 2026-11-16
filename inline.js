@@ -247,7 +247,7 @@ function flank(s, i, len) {
   return { leftFlanking, rightFlanking };
 }
 
-function parseNodes(src, ctx, inLink) {
+function parseNodes(src, ctx, inLink, noEmph) {
   const s = src;
   const n = s.length;
   const nodes = [];
@@ -319,14 +319,25 @@ function parseNodes(src, ctx, inLink) {
       text += "<"; i++; continue;
     }
     if (c === "[" || (c === "!" && s[i + 1] === "[")) {
-      const r = tryLink(s, i, ctx, inLink);
+      const r = tryLink(s, i, ctx, inLink, noEmph);
       if (r) { flush(); nodes.push(r.node); i = r.end; continue; }
+      if (!noEmph && c === "[") {
+        const end = failedLabelSuppressEnd(s, i);
+        if (end > 0) {
+          flush();
+          nodes.push({ t: "html", s: renderNodes(parseNodes(s.slice(i, end), ctx, inLink, true)) });
+          i = end; continue;
+        }
+      }
       text += c; i++; continue;
     }
     if (c === "*" || c === "_" || c === "~") {
       let k = i;
       while (k < n && s[k] === c) k++;
       const len = k - i;
+      // Inside a failed link label holding a backtick code span, marked
+      // does not form emphasis at all: the delimiters stay literal.
+      if (noEmph) { text += s.slice(i, k); i = k; continue; }
       // A tilde run of 3+ is literal text, never a delimiter (gfm-493).
       if (c === "~" && len >= 3) { text += s.slice(i, k); i = k; continue; }
       const { leftFlanking, rightFlanking } = flank(s, i, len);
@@ -524,12 +535,22 @@ function trimBareUrl(url) {
   for (;;) {
     const before = end;
     while (end > 0 && "?!.,:;*_~'\"".includes(url[end - 1])) end--;
-    // Balance parens: drop trailing ) while there are more ) than (.
+    // Balance parens: a trailing ) is dropped only when it has no
+    // matching ( earlier in the URL. Stack discipline: an unmatched
+    // ) does not consume a later (, so `a)](./b/c)` keeps its final
+    // ) (the ( before ./b matches it) while `a(b))` drops its last
+    // one. (Total counts would drop the wrong one in both cases.)
     while (end > 0 && url[end - 1] === ")") {
-      const sub = url.slice(0, end);
-      const open = (sub.match(/\(/g) || []).length;
-      const close = (sub.match(/\)/g) || []).length;
-      if (close > open) end--; else break;
+      let depth = 0;
+      let matched = false;
+      for (let k = 0; k < end; k++) {
+        if (url[k] === "(") depth++;
+        else if (url[k] === ")") {
+          if (depth > 0) { depth--; if (k === end - 1) matched = true; }
+        }
+      }
+      if (matched) break;
+      end--;
     }
     if (end === before) break;
   }
@@ -592,16 +613,28 @@ function parseLinkLabel(s, i) {
   const n = s.length;
   let depth = 0;
   let j = i;
+  // Marked's label scan skips a code span by pairing a backtick run
+  // with the NEXT backtick run (any length, even past a ]): the text
+  // between them is code-span content and a ] in it does not close
+  // the label. If a run has no later run it is unclosed and the
+  // label is invalid, unless the run has length >= 2 and sits
+  // immediately before the closing ] (then it is literal text and
+  // the label closes there).
   while (j < n) {
     const c = s[j];
     if (c === "\\" && j + 1 < n && PUNCT.includes(s[j + 1])) { j += 2; continue; }
     if (c === "`") {
       let k = j;
       while (k < n && s[k] === "`") k++;
-      const run = k - j;
-      const close = findCodeClose(s, k, run);
-      if (close >= 0) { j = close + run; continue; }
-      j = k; continue;
+      const len = k - j;
+      const m = s.indexOf("`", k);
+      if (m === -1) {
+        if (len >= 2 && k < n && s[k] === "]") { j = k; continue; }
+        return null;
+      }
+      let m2 = m;
+      while (m2 < n && s[m2] === "`") m2++;
+      j = m2; continue;
     }
     if (c === "<") {
       // A ] inside a tag's quoted attribute, or inside an autolink URL,
@@ -620,6 +653,48 @@ function parseLinkLabel(s, i) {
     j++;
   }
   return null;
+}
+
+// When a link label scan fails (parseLinkLabel returns null) AND the
+// would-be label (up to its closing ]) holds a code span whose content
+// contains a backtick, marked does not form emphasis anywhere inside
+// that [ ... ] region (though code spans still render). Returns the
+// index just past the closing ] of such a region, or -1.
+function failedLabelSuppressEnd(s, i) {
+  if (parseLinkLabel(s, i)) return -1;
+  const n = s.length;
+  let depth = 0;
+  let hasBacktickCode = false;
+  let j = i;
+  while (j < n) {
+    const c = s[j];
+    if (c === "\\" && j + 1 < n && PUNCT.includes(s[j + 1])) { j += 2; continue; }
+    if (c === "`") {
+      let k = j;
+      while (k < n && s[k] === "`") k++;
+      const run = k - j;
+      const close = findCodeClose(s, k, run);
+      if (close >= 0) {
+        if (s.slice(k, close).includes("`")) hasBacktickCode = true;
+        j = close + run; continue;
+      }
+      j = k; continue;
+    }
+    if (c === "<") {
+      const end = scanAutolink(s, j);
+      if (end > 0) { j = end; continue; }
+      const hend = scanRawHtml(s, j);
+      if (hend > 0) { j = hend; continue; }
+    }
+    if (c === "[") depth++;
+    else if (c === "]") {
+      depth--;
+      if (depth === 0) return hasBacktickCode ? j + 1 : -1;
+      if (depth < 0) return -1;
+    }
+    j++;
+  }
+  return -1;
 }
 
 function skipSpaces(s, i) {
@@ -709,7 +784,7 @@ function decodeNumericRef(s, i, ampAsEntity) {
   return { text: String.fromCodePoint(cp), len: m[0].length };
 }
 
-function tryLink(s, i, ctx, inLink) {
+function tryLink(s, i, ctx, inLink, noEmph) {
   const isImage = s[i] === "!";
   const start = isImage ? i + 1 : i;
   if (s[start] !== "[") return null;
@@ -736,7 +811,7 @@ function tryLink(s, i, ctx, inLink) {
       return { node: { t: "image", src: clean, title, alt: renderAlt(label.text, ctx) }, end: j };
     }
     if (inLink) return null;
-    return { node: { t: "link", href: clean, title, children: parseNodes(label.text, ctx, true) }, end: j };
+    return { node: { t: "link", href: clean, title, children: parseNodes(label.text, ctx, true, noEmph) }, end: j };
   };
   // Inline link: [text](dest "title"). When the (...) is not a valid
   // inline link, fall through and try the reference forms for [text]
@@ -818,12 +893,72 @@ function resolveEmphasis(nodes) {
   for (const nd of nodes) if (nd.t === "delim") delims.push(nd);
   if (delims.length === 0) return nodes;
   const openers = { "*": [], "_": [], "~": [] };
+  // Marked's stray-asterisk behaviour, reverse-engineered from the
+  // reference on small inputs (the CommonMark stack algorithm alone
+  // does not reproduce it). After a "*" run that can both open and
+  // close forms emphasis as a closer, the next "*" closer is
+  // "poisoned": it may not match with a single delimiter (use 1),
+  // except in mode "E" (formed with one delimiter) where a len-1
+  // opener may still be closed with one. A strong formed with an
+  // opener that can also close poisons nothing (cm-411).
+  // The opener a poisoned closer would have matched is "tainted":
+  // later closers skip it for use-1 matches until a closer is
+  // blocked by that taint (then it clears) or a match consumes a
+  // tainted or poison-kept opener. A poison-blocked closer that can
+  // open stays on the stack, marked kept: a later closer's search
+  // stops at a kept opener it cannot use (rule of 3), but continues
+  // past an ordinary rule-of-3-blocked opener (cm-412).
+  // A poisoned closer run longer than the opener it would close
+  // with two delimiters leaves its leading delimiters as literal
+  // text inside the emphasis (dead = min(len-2, 2)), e.g.
+  // **a*b*c*** -> <strong>a<em>b</em>c*</strong>.
+  let poison = null; // "S" | "E" | null, for "*" only
+  let poisonOld = null; // openers on the stack when the poison was set
+  let taintGen = 0;
+  const tainted = new Map(); // opener delimiter -> generation
   for (const closer of delims) {
+    const startGen = taintGen;
+    let taintBlockedOld = false;
+    let poisonedCloser = false;
+    let poisonMode = null;
     if (!closer.canClose || closer.len === 0) {
       if (closer.canOpen && closer.len > 0) openers[closer.ch].push(closer);
       continue;
     }
     const stack = openers[closer.ch];
+    // --- poison path: the first "*" closer after a both-ways
+    // formation. Finds the opener it would have matched.
+    if (closer.ch === "*" && poison) {
+      const mode = poison; poison = null;
+      let o = null;
+      for (let oi = stack.length - 1; oi >= 0; oi--) {
+        const cand = stack[oi];
+        if (cand.len === 0) continue;
+        if ((cand.canClose || closer.canOpen) && (cand.len + closer.len) % 3 === 0 && !(cand.len % 3 === 0 && closer.len % 3 === 0)) {
+          if (cand.kept) break;
+          continue;
+        }
+        if (tainted.has(cand) && !(cand.len >= 2 && closer.len >= 2)) continue;
+        o = cand; break;
+      }
+      // The poison only reaches an opener that predates the
+      // formation; an opener pushed after it is unaffected
+      // (e.g. *quote html directory* after **class**).
+      if (o && poisonOld && poisonOld.has(o)) {
+        const use2 = o.len >= 2 && closer.len >= 2;
+        if (use2 && closer.len > o.len && !closer.canOpen) {
+          const dead = Math.min(closer.len - o.len, 2);
+          nodes.splice(nodes.indexOf(closer), 0, { t: "text", s: "*".repeat(dead) });
+          closer.len -= dead;
+        }
+        if (!use2 && (mode === "S" || o.len >= 2)) {
+          tainted.set(o, ++taintGen);
+          poisonedCloser = true;
+          poisonMode = mode;
+          if (closer.canOpen) closer.kept = true;
+        }
+      }
+    }
     // A closer with delimiters left keeps looking for openers (e.g.
     // ***a***: the closer first makes <strong>, then the leftovers
     // make <em> around it).
@@ -833,7 +968,20 @@ function resolveEmphasis(nodes) {
       while (oi >= 0) {
         const cand = stack[oi];
         if (cand.len === 0) { stack.splice(oi, 1); oi--; continue; }
-        if ((cand.canClose || closer.canOpen) && (cand.len + closer.len) % 3 === 0 && !(cand.len % 3 === 0 && closer.len % 3 === 0)) { oi--; continue; }
+        if ((cand.canClose || closer.canOpen) && (cand.len + closer.len) % 3 === 0 && !(cand.len % 3 === 0 && closer.len % 3 === 0)) {
+          if (cand.kept) break;
+          oi--; continue;
+        }
+        const use1 = !(cand.len >= 2 && closer.len >= 2);
+        const tg = tainted.get(cand);
+        if (tg !== undefined && use1) {
+          if (tg <= startGen) taintBlockedOld = true;
+          oi--; continue;
+        }
+        // A poisoned closer may not close any opener that predates
+        // the formation with one delimiter (its would-be opener is
+        // tainted above; this covers the earlier ones behind it).
+        if (poisonedCloser && use1 && poisonOld && poisonOld.has(cand) && (poisonMode === "S" || cand.len >= 2)) { oi--; continue; }
         opener = cand; break;
       }
       if (!opener) break;
@@ -853,6 +1001,16 @@ function resolveEmphasis(nodes) {
       const children = nodes.slice(oi2 + 1, ci2);
       const kind = closer.ch === "~" ? "del" : (use === 2 ? "strong" : "em");
       const emNode = { t: kind, children };
+      // A closer that can both open and close poisons the next "*"
+      // closer (see above), unless it formed strong with an opener
+      // that can also close (cm-411: *foo**bar**baz*).
+      if (closer.ch === "*" && closer.canOpen && closer.canClose) {
+        if (use === 1) { poison = "E"; poisonOld = new Set(openers["*"]); }
+        else if (!opener.canClose) { poison = "S"; poisonOld = new Set(openers["*"]); }
+      }
+      // A match consuming a tainted or poison-kept opener clears
+      // the taint.
+      if (opener.kept || tainted.has(opener)) tainted.clear();
       // Delimiters swallowed into the new emphasis node are no longer
       // available as openers at this level (cf. cm-470).
       purgeDelims(children, openers);
@@ -866,6 +1024,8 @@ function resolveEmphasis(nodes) {
       if (opener.len === 0) { const p = stack.indexOf(opener); if (p >= 0) stack.splice(p, 1); }
     }
     if (closer.len > 0 && closer.canOpen) stack.push(closer);
+    // Blocked by an older taint and left unmatched: the taint clears.
+    if (taintBlockedOld && closer.len > 0) tainted.clear();
   }
   return nodes;
 }

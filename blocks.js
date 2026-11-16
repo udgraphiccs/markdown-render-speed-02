@@ -536,6 +536,20 @@ export function splitTableRow(line) {
           } else k += 1;
         }
         if (found) inCode = run;
+        else {
+          // A failed code-span open also swallows the NEXT backtick run
+          // as literal text (doc-18: `` ``add` `` — the lone ` after
+          // add must not open a code span, or the | after it would not
+          // separate the cells).
+          const m = line.indexOf("`", j);
+          if (m >= 0) {
+            let m2 = m;
+            while (m2 < n && line[m2] === "`") m2 += 1;
+            cur += line.slice(i, m2);
+            i = m2;
+            continue;
+          }
+        }
       }
       cur += line.slice(i, j);
       i = j;
@@ -688,7 +702,13 @@ export function parseBlocks(lines, i0, i1, state, inItem) {
           const m = /^(`{3,}|~{3,})[ \t]*$/.exec(s.rest);
           if (m && m[1][0] === fence.marker && m[1].length >= fence.len) break;
         }
-        code.push(stripFenceIndent(l, fence.indent));
+        // A tilde fence does not strip its indent from content lines
+        // (marked quirk: `  ~~~` keeps the content's leading spaces,
+        // while a backtick fence at the same indent strips them);
+        // only the lazy-continuation marker is dropped.
+        code.push(fence.marker === "~"
+          ? (l.startsWith("\u0000") ? l.slice(1) : l)
+          : stripFenceIndent(l, fence.indent));
         j += 1;
       }
       const info = fence.info.trim();
@@ -921,7 +941,10 @@ export function collectQuote(lines, i, i1) {
       // is dedented by 4 columns and marked (\u0000) so the inner parse
       // keeps it as paragraph text; a setext-shaped line is indented by
       // 4 so it cannot become a setext underline (cm-093, cm-238).
-      let t = stripCols(line, 4);
+      // A lazy line indented under 4 keeps its leading spaces verbatim
+      // (doc-25/40: ` fn main()` and `  indented with a tab` keep
+      // their spaces); only a line indented 4+ is dedented.
+      let t = indentInfo(line).cols >= 4 ? stripCols(line, 4) : line;
       if (matchSetext(t)) t = "    " + t;
       inner.push("\u0000" + t);
       prevInner = t;
